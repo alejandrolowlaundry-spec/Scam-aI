@@ -1,0 +1,66 @@
+"""
+Alembic env.py — uses sync connections for migrations.
+The app runtime uses async (aiosqlite/asyncpg) but Alembic only needs sync.
+"""
+from logging.config import fileConfig
+from sqlalchemy import engine_from_config, pool
+from alembic import context
+import sys, os, re
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+from app.database import Base
+from app.models import Call  # noqa: F401 — ensure model is loaded for metadata
+
+config = context.config
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+
+def _sync_url(url: str) -> str:
+    """Strip async driver prefixes so Alembic can use a sync engine."""
+    url = url.replace("sqlite+aiosqlite", "sqlite")
+    url = url.replace("postgresql+asyncpg", "postgresql")
+    url = url.replace("postgresql+aiopg", "postgresql")
+    return url
+
+
+def _get_url() -> str:
+    # Prefer DATABASE_URL env var over alembic.ini value
+    from app.config import settings
+    return _sync_url(settings.database_url)
+
+
+def run_migrations_offline() -> None:
+    context.configure(
+        url=_get_url(),
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    cfg = config.get_section(config.config_ini_section, {})
+    cfg["sqlalchemy.url"] = _get_url()
+
+    connectable = engine_from_config(
+        cfg,
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
