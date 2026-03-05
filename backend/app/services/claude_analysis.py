@@ -185,6 +185,9 @@ async def analyze_transcript(
             logger.warning("no_ai_provider_configured")
             return MOCK_LOW_RISK
 
+        from app.services.risk_scoring import apply_post_signals
+        result = apply_post_signals(result, transcript)
+
         logger.info(
             "analysis_complete",
             provider=provider,

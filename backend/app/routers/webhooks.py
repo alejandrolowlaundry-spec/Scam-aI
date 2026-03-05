@@ -37,14 +37,17 @@ async def _process_call(call_sid: str, recording_url: str) -> None:
             logger.warning("call_not_found_for_processing", call_sid=call_sid)
             return
 
-        # 1. Transcribe
+        # 1. Transcribe (fall back to existing transcript if AssemblyAI fails)
         try:
             transcript = await transcription.transcribe_recording(recording_url, call_sid)
             call.transcript = transcript
             await db.commit()
         except Exception as e:
-            logger.error("transcription_failed", call_sid=call_sid, error=str(e))
-            return
+            logger.warning("transcription_failed_using_fallback", call_sid=call_sid, error=str(e))
+            transcript = call.transcript
+            if not transcript:
+                logger.error("no_transcript_available", call_sid=call_sid)
+                return
 
         # 2. Analyze with Claude
         try:

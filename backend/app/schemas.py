@@ -11,6 +11,7 @@ class FraudSignals(BaseModel):
     spoofing_suspected: bool = False
     inconsistencies: list[str] = []
     script_match: list[str] = []
+    double_thank_you: bool = False
 
 
 class FraudAnalysisResult(BaseModel):

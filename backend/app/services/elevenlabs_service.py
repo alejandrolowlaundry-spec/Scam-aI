@@ -22,15 +22,23 @@ STEP_SCRIPTS: dict[str, str] = {
         "Could you please confirm the shipping address for the order?"
     ),
     "ask_billing": (
-        "Thank you. Could you also confirm the billing address used for the payment?"
+        "Could you also confirm the billing address used for the payment?"
     ),
     "ask_reason": (
         "I noticed the shipping and billing addresses are different. "
         "Could you briefly let me know why?"
     ),
     "confirmation": (
-        "Perfect, thank you for confirming. "
-        "Your order verification is complete and your order will proceed to shipping."
+        "Thank you — your order is verified and will proceed to shipping."
+    ),
+    "closing_1": (
+        "Laundry Owners Warehouse appreciates your business. Have a great day."
+    ),
+    "closing_2": (
+        "It's always a pleasure serving you. Thank you for choosing Laundry Owners Warehouse."
+    ),
+    "closing_3": (
+        "Laundry Owners Warehouse appreciates working with you. Have a great day."
     ),
 }
 

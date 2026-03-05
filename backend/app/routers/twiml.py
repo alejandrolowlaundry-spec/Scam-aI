@@ -19,6 +19,7 @@ Call structure:
 from __future__ import annotations
 import asyncio
 import json
+import random
 import uuid
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import Response
@@ -37,9 +38,15 @@ router = APIRouter()
 # ── Fixed scripts (exact wording from spec) ───────────────────────────────────
 
 _Q_SHIPPING   = "Could you please confirm the shipping address for the order?"
-_Q_BILLING    = "Thank you. Could you also confirm the billing address used for the payment?"
+_Q_BILLING    = "Could you also confirm the billing address used for the payment?"
 _Q_REASON     = "I noticed the shipping and billing addresses are different. Could you briefly let me know why?"
-_CONFIRMATION = "Perfect, thank you for confirming. Your order verification is complete and your order will proceed to shipping."
+_CONFIRMATION = "Thank you — your order is verified and will proceed to shipping."
+
+_CLOSINGS = [
+    ("closing_1", "Laundry Owners Warehouse appreciates your business. Have a great day."),
+    ("closing_2", "It's always a pleasure serving you. Thank you for choosing Laundry Owners Warehouse."),
+    ("closing_3", "Laundry Owners Warehouse appreciates working with you. Have a great day."),
+]
 
 
 # ── Per-state GPT-4o prompts ──────────────────────────────────────────────────
@@ -60,7 +67,7 @@ EXTRACTION RULES (be very permissive — speech recognition may garble addresses
 - If the caller explicitly refuses, set refused = true.
 
 RESPONSE RULES:
-- If shipping captured: acknowledge warmly in 1 sentence. Example: "Got it, thank you."
+- If shipping captured: acknowledge in 1 sentence with "thank you". Example: "Got it, thank you." or "Thank you, got it."
 - If off_topic: acknowledge in 1 sentence, then redirect:
   "Of course. Just to complete the verification — could you confirm the shipping address?"
 - If nothing captured: ask again gently: "Could you please confirm the shipping address?"
@@ -82,7 +89,7 @@ def _prompt_collect_billing(shipping: str) -> str:
     return f"""\
 You are a verification specialist for Laundry Owners Warehouse on a phone call.
 Shipping address already confirmed: {shipping}
-The caller just heard: "Thank you. Could you also confirm the billing address used for the payment?"
+The caller just heard: "Could you also confirm the billing address used for the payment?"
 
 YOUR TASK: Extract the billing address from the caller's response.
 
@@ -94,7 +101,7 @@ EXTRACTION RULES (be very permissive — speech recognition may garble addresses
 - If the caller explicitly refuses (says "no", "I won't", "stop"), set refused = true
 
 RESPONSE RULES:
-- If billing captured: acknowledge in 1 sentence. Example: "Got it, thank you."
+- If billing captured: acknowledge in 1 sentence — no "thank you". Example: "Got it." or "Perfect."
 - If off_topic: 1-sentence acknowledge + redirect to billing address question.
 - If nothing captured: ask again gently.
 - If refused: polite 1-sentence closing.
@@ -126,7 +133,7 @@ EXTRACTION RULES:
 - If the caller explicitly refuses, set refused = true.
 
 RESPONSE RULES:
-- If reason captured: acknowledge in 1 sentence. Example: "Understood, thank you."
+- If reason captured: acknowledge in 1 sentence — no "thank you". Example: "Understood." or "Got it."
 - If off_topic: acknowledge + redirect to asking why the addresses differ.
 - If nothing captured: ask again gently.
 - If refused: polite 1-sentence closing.
@@ -336,7 +343,7 @@ async def _ai_respond(call_sid: str, speech: str) -> dict:
         if caller_text and caller_text != "(no response)" and len(caller_text.split()) >= 2:
             call_state.save(call_sid, "billing_address", caller_text)
             billing = caller_text
-            ack = "Got it, thank you."
+            ack = "Got it."
             return await _after_both_captured(call_sid, shipping, billing, ack, messages)
 
         messages.append({"role": "assistant", "content": ack})
@@ -384,11 +391,11 @@ async def _after_both_captured(
 ) -> dict:
     """Called when both addresses are in hand. Compares and routes to next step."""
     if _addresses_same(shipping, billing):
-        # Same → confirm and close
+        # Same → confirm and close. No ack — confirmation is the only audio that plays.
         call_state.save(call_sid, "step", "done")
         messages.append({"role": "assistant", "content": _CONFIRMATION})
         call_state.save(call_sid, "messages", messages)
-        return {"ack": ack, "next_q": _CONFIRMATION, "next_audio": "confirmation",
+        return {"ack": "", "next_q": _CONFIRMATION, "next_audio": "confirmation",
                 "done": True, "refused": False}
     else:
         # Different → ask reason
@@ -479,14 +486,11 @@ async def step_respond(
         asyncio.create_task(_persist_result(CallSid, shipping, billing, reason, approved))
         call_state.clear(CallSid)
 
-        # Build closing audio (ack + confirmation or just confirmation)
-        parts = []
-        if ack_text:
-            parts.append(await _audio(base, ack_text))
-        if next_q:
-            parts.append(await _audio(base, next_q, next_audio))
-        return _xml("\n".join(parts) if parts else
-                    f'<Say voice="alice" language="en-US">{_CONFIRMATION}</Say>')
+        # Confirmation + polite closing — never the intermediate ack.
+        confirmation_audio = await _audio(base, next_q or _CONFIRMATION, next_audio or "confirmation")
+        closing_step, closing_text = random.choice(_CLOSINGS)
+        closing_audio = await _audio(base, closing_text, closing_step)
+        return _xml(f"{confirmation_audio}\n{closing_audio}")
 
     # Not done — play ack then next question (or just ack if caller went off-topic)
     parts = []
