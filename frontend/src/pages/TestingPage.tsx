@@ -7,6 +7,7 @@ interface TestCallForm {
   phone: string
   email: string
   order_name: string
+  hubspot_deal_id: string
 }
 
 async function initiateTestCall(form: TestCallForm) {
@@ -19,18 +20,35 @@ async function fetchTestCalls() {
   return data
 }
 
+async function testHubSpotUpdate(deal_id: string, fraud_label: string) {
+  const { data } = await axios.post('/api/testing/hubspot-update', { deal_id, fraud_label })
+  return data
+}
+
 export function TestingPage() {
-  const [form, setForm] = useState<TestCallForm>({ phone: '', email: '', order_name: '' })
+  const [form, setForm] = useState<TestCallForm>({ phone: '', email: '', order_name: '', hubspot_deal_id: '12345 Alejandro Pending' })
   const [result, setResult] = useState<any>(null)
+  const [hubspotDeal, setHubspotDeal] = useState('12345 Alejandro Pending')
+  const [hubspotLabel, setHubspotLabel] = useState('Safe Customer')
+  const [hubspotResult, setHubspotResult] = useState<any>(null)
 
   const mutation = useMutation({
     mutationFn: initiateTestCall,
     onSuccess: (data) => {
       setResult(data)
-      setForm({ phone: '', email: '', order_name: '' })
+      setForm({ phone: '', email: '', order_name: '', hubspot_deal_id: '' })
     },
     onError: (err: any) => {
       alert(err?.response?.data?.detail || 'Failed to initiate test call')
+    },
+  })
+
+  const hubspotMutation = useMutation({
+    mutationFn: ({ deal_id, fraud_label }: { deal_id: string; fraud_label: string }) =>
+      testHubSpotUpdate(deal_id, fraud_label),
+    onSuccess: (data) => setHubspotResult(data),
+    onError: (err: any) => {
+      setHubspotResult({ success: false, error: err?.response?.data?.detail || 'Failed' })
     },
   })
 
@@ -54,6 +72,54 @@ export function TestingPage() {
         <p className="text-sm text-gray-500 mt-1">
           Trigger a test verification call to any number and see the full AI analysis pipeline live.
         </p>
+      </div>
+
+      {/* HubSpot Direct Update Test */}
+      <div className="bg-white rounded-xl border-2 border-blue-200 shadow-sm p-6">
+        <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
+          <span className="text-xl">🔗</span> Test HubSpot Update Directly
+        </h3>
+        <p className="text-sm text-gray-500 mb-4">No phone call needed — click the button to update the deal in HubSpot right now.</p>
+        <div className="flex gap-3 mb-3">
+          <input
+            type="text"
+            value={hubspotDeal}
+            onChange={e => setHubspotDeal(e.target.value)}
+            placeholder="Deal name or numeric ID"
+            className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+          <select
+            value={hubspotLabel}
+            onChange={e => setHubspotLabel(e.target.value)}
+            className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <option value="Safe Customer">Safe Customer</option>
+            <option value="Suspicious">Suspicious</option>
+            <option value="Confirmed Scam">Confirmed Scam</option>
+          </select>
+        </div>
+        <button
+          onClick={() => hubspotMutation.mutate({ deal_id: hubspotDeal, fraud_label: hubspotLabel })}
+          disabled={hubspotMutation.isPending || !hubspotDeal.trim()}
+          className="w-full flex items-center justify-center gap-2 px-5 py-3 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-semibold rounded-lg transition-colors"
+        >
+          {hubspotMutation.isPending ? '⏳ Updating...' : '🚀 Update HubSpot Deal Now'}
+        </button>
+
+        {hubspotResult && (
+          <div className={`mt-4 p-4 rounded-lg text-sm ${hubspotResult.success ? 'bg-green-50 border border-green-200 text-green-800' : 'bg-red-50 border border-red-200 text-red-800'}`}>
+            {hubspotResult.success ? (
+              <>
+                <p className="font-semibold">✅ Deal updated successfully!</p>
+                <p className="mt-1">Deal ID: <span className="font-mono">{hubspotResult.deal_id}</span></p>
+                <p>Verdict: <strong>{hubspotResult.fraud_label}</strong></p>
+                <p>Contact updated: {hubspotResult.contact_updated ? 'Yes' : 'No'}</p>
+              </>
+            ) : (
+              <p className="font-semibold">❌ {hubspotResult.error}</p>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Form */}
@@ -117,6 +183,29 @@ export function TestingPage() {
                 className="flex-1 rounded-r-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
             </div>
+          </div>
+
+          {/* HubSpot Deal ID */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              HubSpot Deal ID <span className="text-blue-500 font-normal">(required to update CRM)</span>
+            </label>
+            <div className="flex">
+              <span className="inline-flex items-center px-3 rounded-l-lg border border-r-0 border-gray-300 bg-gray-50 text-gray-500 text-sm">
+                🔗
+              </span>
+              <input
+                type="text"
+                placeholder="e.g. 12345678"
+                value={form.hubspot_deal_id}
+                onChange={e => setForm(f => ({ ...f, hubspot_deal_id: e.target.value }))}
+                className="flex-1 rounded-r-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <p className="text-xs text-gray-400 mt-1">
+              Find it in HubSpot → open the deal → copy the ID from the URL (e.g. /deal/<strong>12345678</strong>).
+              Leave blank to skip CRM update.
+            </p>
           </div>
 
           <button

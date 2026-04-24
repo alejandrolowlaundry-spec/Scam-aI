@@ -21,7 +21,7 @@ import asyncio
 import json
 import random
 import uuid
-from fastapi import APIRouter, Request, Form
+from fastapi import APIRouter, BackgroundTasks, Request, Form
 from fastapi.responses import Response
 from openai import AsyncOpenAI
 from sqlalchemy import select
@@ -421,17 +421,19 @@ async def verification_call_twiml(
     base = _base_url(request)
     state = call_state.load(CallSid) if CallSid else {}
     customer_name = state.get("customer_name", "")
+    order_number  = state.get("order_number", "")
 
     # Greeting text (intro only — question is asked separately)
+    order_ref = f" for order number {order_number}" if order_number else ""
     if customer_name:
         greeting_text = (
             f"Hi {customer_name}, this is Laundry Owners Warehouse. "
-            "We just need to quickly verify your order before we can ship it."
+            f"We just need to quickly verify your order{order_ref} before we can ship it."
         )
     else:
         greeting_text = (
             "Hello, this is Laundry Owners Warehouse. "
-            "We just need to quickly verify your order before we can ship it."
+            f"We just need to quickly verify your order{order_ref} before we can ship it."
         )
 
     # Greeting audio: ElevenLabs pre-cached (personalized) > <Say>
@@ -462,6 +464,7 @@ async def verification_call_twiml(
 @router.post("/step/respond")
 async def step_respond(
     request: Request,
+    background_tasks: BackgroundTasks,
     CallSid: str = Form(...),
     SpeechResult: Optional[str] = Form(None),
 ):
@@ -483,7 +486,7 @@ async def step_respond(
         reason    = state.get("difference_reason", "")
         approved  = not refused
 
-        asyncio.create_task(_persist_result(CallSid, shipping, billing, reason, approved))
+        background_tasks.add_task(_persist_result, CallSid, shipping, billing, reason, approved)
         call_state.clear(CallSid)
 
         # Confirmation + polite closing — never the intermediate ack.
@@ -543,7 +546,8 @@ async def _persist_result(
     if shipping and billing and not _addresses_same(shipping, billing):
         reasons.append(f"Addresses differed — reason provided: {'yes' if diff_reason else 'no'}")
 
-    deal_id: Optional[str] = None
+    deal_id:    Optional[str] = None
+    contact_id: Optional[str] = None
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(Call).where(Call.call_sid == call_sid))
@@ -563,29 +567,48 @@ async def _persist_result(
             "difference_reason": diff_reason,
             "approved": approved,
         }
-        deal_id = call.hubspot_deal_id
+        deal_id    = call.hubspot_deal_id
+        contact_id = call.hubspot_contact_id
         await db.commit()
 
+    updated = False
+
+    # Resolve deal_id to numeric HubSpot ID (handles "12345 Name Text" entries)
+    real_deal_id: Optional[str] = None
     if deal_id:
-        try:
-            await hubspot_service.update_deal_fraud_status(deal_id, fraud_label)
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(select(Call).where(Call.call_sid == call_sid))
-                call = result.scalar_one_or_none()
-                if call:
-                    call.hubspot_updated = True
-                    await db.commit()
-        except Exception as e:
-            logger.error("hubspot_update_failed", call_sid=call_sid, error=str(e))
-    else:
-        updated = await hubspot_service.complete_test_order()
-        if updated:
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(select(Call).where(Call.call_sid == call_sid))
-                call = result.scalar_one_or_none()
-                if call:
-                    call.hubspot_updated = True
-                    await db.commit()
+        real_deal_id = await hubspot_service.resolve_deal_id(deal_id)
+        if real_deal_id and real_deal_id != deal_id:
+            # Save the resolved numeric ID back so subsequent pipeline steps use it
+            async with AsyncSessionLocal() as db2:
+                result2 = await db2.execute(select(Call).where(Call.call_sid == call_sid))
+                call2 = result2.scalar_one_or_none()
+                if call2:
+                    call2.hubspot_deal_id = real_deal_id
+                    await db2.commit()
+
+    if real_deal_id:
+        updated = await hubspot_service.update_deal_fraud_status(real_deal_id, fraud_label)
+
+        # Also update the contact name if we have a contact ID
+        if contact_id:
+            deal = await hubspot_service.get_deal_by_id(real_deal_id)
+            if deal and deal.contact_name:
+                parts     = deal.contact_name.split(" ", 1)
+                firstname = parts[0]
+                lastname  = parts[1] if len(parts) > 1 else ""
+                await hubspot_service.update_contact_name(contact_id, firstname, lastname)
+
+    # Fallback: search by deal name if resolution failed entirely
+    if not updated:
+        updated = await hubspot_service.complete_test_order(deal_name_hint=deal_id or "")
+
+    if updated:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Call).where(Call.call_sid == call_sid))
+            call = result.scalar_one_or_none()
+            if call:
+                call.hubspot_updated = True
+                await db.commit()
 
     logger.info("verification_complete", call_sid=call_sid,
                 approved=approved, risk_score=risk_score, fraud_label=fraud_label)

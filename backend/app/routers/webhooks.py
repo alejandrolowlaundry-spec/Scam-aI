@@ -71,23 +71,44 @@ async def _process_call(call_sid: str, recording_url: str) -> None:
         call.raw_claude_json = analysis.model_dump()
         call.analysis_summary = analysis.summary
 
-        # 4. Update HubSpot deal status + attach call note
+        # 4. Update HubSpot deal status + attach call note + update contact name
         if call.hubspot_deal_id:
-            updated = await hubspot_service.update_deal_fraud_status(
-                call.hubspot_deal_id, analysis.fraud_label
-            )
-            call.hubspot_updated = updated
+            # Resolve to numeric deal ID (handles text entries like "12345 Name Pending")
+            real_deal_id = await hubspot_service.resolve_deal_id(call.hubspot_deal_id)
+            if real_deal_id and real_deal_id != call.hubspot_deal_id:
+                call.hubspot_deal_id = real_deal_id
+                await db.commit()
+
+            if real_deal_id:
+                updated = await hubspot_service.update_deal_fraud_status(
+                    real_deal_id, analysis.fraud_label
+                )
+                call.hubspot_updated = updated
+            else:
+                updated = False
+
+            # Update contact name if we have a contact ID and a name on record
+            if real_deal_id and call.hubspot_contact_id:
+                deal = await hubspot_service.get_deal_by_id(real_deal_id)
+                if deal and deal.contact_name:
+                    parts = deal.contact_name.split(" ", 1)
+                    firstname = parts[0]
+                    lastname  = parts[1] if len(parts) > 1 else ""
+                    await hubspot_service.update_contact_name(
+                        call.hubspot_contact_id, firstname, lastname
+                    )
 
             # Attach full fraud analysis as a note on the deal
-            await hubspot_service.create_call_note(
-                deal_id=call.hubspot_deal_id,
-                call_sid=call_sid,
-                fraud_label=analysis.fraud_label,
-                risk_score=analysis.risk_score,
-                reasons=analysis.reasons,
-                transcript=call.transcript,
-                recording_url=call.recording_url,
-            )
+            if real_deal_id:
+                await hubspot_service.create_call_note(
+                    deal_id=real_deal_id,
+                    call_sid=call_sid,
+                    fraud_label=analysis.fraud_label,
+                    risk_score=analysis.risk_score,
+                    reasons=analysis.reasons,
+                    transcript=call.transcript,
+                    recording_url=call.recording_url,
+                )
 
         # 5. Alert if high risk
         if analysis.risk_label == "high" and not call.alert_sent:
@@ -109,6 +130,40 @@ async def _process_call(call_sid: str, recording_url: str) -> None:
             risk_score=analysis.risk_score,
             fraud_label=analysis.fraud_label,
         )
+
+
+async def _hubspot_update_on_completion(call_sid: str) -> None:
+    """Fire HubSpot update when call completes — uses fraud_label from TwiML if available, else 'Safe Customer'."""
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Call).where(Call.call_sid == call_sid))
+        call = result.scalar_one_or_none()
+        if not call or not call.hubspot_deal_id or call.hubspot_updated:
+            return
+
+        fraud_label = call.fraud_label or "Safe Customer"
+
+        real_deal_id = await hubspot_service.resolve_deal_id(call.hubspot_deal_id)
+        if not real_deal_id:
+            logger.warning("hubspot_update_on_completion_no_deal", call_sid=call_sid)
+            return
+
+        if real_deal_id != call.hubspot_deal_id:
+            call.hubspot_deal_id = real_deal_id
+
+        updated = await hubspot_service.update_deal_fraud_status(real_deal_id, fraud_label)
+        call.hubspot_updated = updated
+
+        # Update contact name
+        deal = await hubspot_service.get_deal_by_id(real_deal_id)
+        if deal and deal.contact_id and deal.contact_name:
+            parts = deal.contact_name.split(" ", 1)
+            await hubspot_service.update_contact_name(
+                deal.contact_id, parts[0], parts[1] if len(parts) > 1 else ""
+            )
+
+        await db.commit()
+        logger.info("hubspot_updated_on_call_completion", call_sid=call_sid,
+                    deal_id=real_deal_id, fraud_label=fraud_label)
 
 
 @router.post("/call-status")
@@ -151,6 +206,10 @@ async def call_status_webhook(
                 call.duration = int(Duration)
 
         await db.commit()
+
+    # As soon as call is answered, update HubSpot immediately
+    if CallStatus == "in-progress":
+        background_tasks.add_task(_hubspot_update_on_completion, CallSid)
 
     return Response(content="<?xml version='1.0'?><Response/>", media_type="application/xml")
 

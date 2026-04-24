@@ -32,6 +32,15 @@ FRAUD_LABEL_TO_TAG = {
     "Confirmed Scam":   TAG_FRAUD,
 }
 
+# Map fraud_label → deal stage ID (pulled from config at runtime)
+def _fraud_label_to_stage_id(fraud_label: str) -> str:
+    mapping = {
+        "Safe Customer":  settings.hubspot_stage_safe_customer,
+        "Suspicious":     settings.hubspot_stage_review,
+        "Confirmed Scam": settings.hubspot_stage_fraud,
+    }
+    return mapping.get(fraud_label, "")
+
 
 def _headers() -> dict:
     return {
@@ -44,6 +53,92 @@ def _replace_tag(deal_name: str, new_tag: str) -> str:
     """Swap any existing Fraud Check tag in the deal name with the new one."""
     cleaned = re.sub(r"\s*\(Fraud Check = [^)]+\)", "", deal_name).strip()
     return f"{cleaned} {new_tag}"
+
+
+async def resolve_deal_id(deal_id_or_hint: str) -> Optional[str]:
+    """
+    If deal_id_or_hint is already numeric, return it as-is.
+    Otherwise search HubSpot by matching ALL words in the deal name.
+    """
+    if deal_id_or_hint.strip().isdigit():
+        return deal_id_or_hint.strip()
+
+    words = [w for w in deal_id_or_hint.strip().split() if w]
+    filters = [
+        {"propertyName": "dealname", "operator": "CONTAINS_TOKEN", "value": w}
+        for w in words
+    ]
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            resp = await client.post(
+                f"{BASE_URL}/crm/v3/objects/deals/search",
+                headers=_headers(),
+                json={
+                    "filterGroups": [{"filters": filters}],
+                    "properties": ["dealname"],
+                    "limit": 1,
+                },
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+            if results:
+                found_id = results[0]["id"]
+                logger.info("deal_id_resolved", hint=deal_id_or_hint, resolved_id=found_id)
+                return found_id
+        except Exception as e:
+            logger.warning("resolve_deal_id_failed", hint=deal_id_or_hint, error=str(e))
+
+    return None
+
+
+async def update_deal_stage(deal_id: str, stage_id: str) -> bool:
+    """Update the HubSpot deal stage property (dealstage)."""
+    if not stage_id:
+        logger.info("hubspot_stage_update_skipped", deal_id=deal_id,
+                    reason="No stage ID configured for this fraud label")
+        return False
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            resp = await client.patch(
+                f"{BASE_URL}/crm/v3/objects/deals/{deal_id}",
+                headers=_headers(),
+                json={"properties": {"dealstage": stage_id}},
+            )
+            resp.raise_for_status()
+            logger.info("hubspot_deal_stage_updated", deal_id=deal_id, stage_id=stage_id)
+            return True
+        except Exception as e:
+            logger.error("hubspot_stage_update_failed", deal_id=deal_id,
+                         stage_id=stage_id, error=str(e))
+            return False
+
+
+async def update_contact_name(contact_id: str, firstname: str, lastname: str = "") -> bool:
+    """Write firstname (and optionally lastname) back to the HubSpot contact record."""
+    if not contact_id or not firstname:
+        return False
+
+    props: dict = {"firstname": firstname}
+    if lastname:
+        props["lastname"] = lastname
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            resp = await client.patch(
+                f"{BASE_URL}/crm/v3/objects/contacts/{contact_id}",
+                headers=_headers(),
+                json={"properties": props},
+            )
+            resp.raise_for_status()
+            logger.info("hubspot_contact_name_updated", contact_id=contact_id,
+                        firstname=firstname, lastname=lastname)
+            return True
+        except Exception as e:
+            logger.error("hubspot_contact_name_update_failed", contact_id=contact_id,
+                         error=str(e))
+            return False
 
 
 async def get_pending_fraud_deals() -> list[HubSpotDeal]:
@@ -60,7 +155,7 @@ async def get_pending_fraud_deals() -> list[HubSpotDeal]:
                     "filters": [{
                         "propertyName": "dealname",
                         "operator": "CONTAINS_TOKEN",
-                        "value": "Pending Verification",
+                        "value": "Pending",
                     }]
                 }],
                 "properties": ["dealname", "amount", "createdate"],
@@ -128,18 +223,21 @@ async def _get_deal_contact(deal_id: str) -> dict:
 
 async def update_deal_fraud_status(deal_id: str, fraud_label: str) -> bool:
     """
-    Rename the deal by replacing the Fraud Check tag.
+    Update the deal after a fraud verification call:
+      1. Rename deal — replaces the Fraud Check tag in the deal name
+      2. Update dealstage — moves deal to the configured pipeline stage
     fraud_label: 'Safe Customer' | 'Suspicious' | 'Confirmed Scam'
     """
     if settings.demo_mode:
         logger.info("demo_hubspot_update", deal_id=deal_id, fraud_label=fraud_label)
         return True
 
-    new_tag = FRAUD_LABEL_TO_TAG.get(fraud_label, TAG_REVIEW)
+    new_tag   = FRAUD_LABEL_TO_TAG.get(fraud_label, TAG_REVIEW)
+    stage_id  = _fraud_label_to_stage_id(fraud_label)
 
     async with httpx.AsyncClient(timeout=30) as client:
         try:
-            # Fetch current deal name
+            # 1. Fetch current deal name
             get_resp = await client.get(
                 f"{BASE_URL}/crm/v3/objects/deals/{deal_id}",
                 headers=_headers(),
@@ -150,14 +248,19 @@ async def update_deal_fraud_status(deal_id: str, fraud_label: str) -> bool:
 
             new_name = _replace_tag(current_name, new_tag)
 
-            # Patch the deal name
+            # 2. Build the PATCH payload — always update name, add stage if configured
+            patch_props: dict = {"dealname": new_name}
+            if stage_id:
+                patch_props["dealstage"] = stage_id
+
             patch_resp = await client.patch(
                 f"{BASE_URL}/crm/v3/objects/deals/{deal_id}",
                 headers=_headers(),
-                json={"properties": {"dealname": new_name}},
+                json={"properties": patch_props},
             )
             patch_resp.raise_for_status()
-            logger.info("hubspot_deal_renamed", deal_id=deal_id, new_name=new_name)
+            logger.info("hubspot_deal_updated", deal_id=deal_id,
+                        new_name=new_name, stage_id=stage_id or "not_configured")
             return True
         except Exception as e:
             logger.error("hubspot_update_failed", deal_id=deal_id, error=str(e))
@@ -303,41 +406,32 @@ async def get_contact_first_name_by_phone(phone: str) -> str:
 TEST_ORDER_NAME = "Alejandro Pending Verification"
 
 
-async def complete_test_order() -> bool:
+async def complete_test_order(deal_name_hint: str = "") -> bool:
     """
-    Find the deal named 'Alejandro Pending Verification' and rename it to
-    'Alejandro Completed' immediately after AI verification confirms the order.
-
-    Safety: only touches a deal whose name matches 'alejandro pending verification'.
-    No other HubSpot deals are ever modified by this function.
+    Find a pending deal by name and mark it completed.
+    Uses deal_name_hint (e.g. "12345 Alejandro Pending") to build search filters.
     """
     if settings.demo_mode:
         logger.info("demo_test_order_completed")
         return True
 
+    # Extract meaningful word tokens from the hint (skip pure numbers)
+    hint_words = [w for w in deal_name_hint.split() if w and not w.isdigit()] if deal_name_hint else []
+    # Always anchor on "Pending"; add up to 2 words from the hint
+    search_words = list(dict.fromkeys(hint_words[:2] + ["Pending"]))
+
+    filters = [
+        {"propertyName": "dealname", "operator": "CONTAINS_TOKEN", "value": w}
+        for w in search_words
+    ]
+
     async with httpx.AsyncClient(timeout=30) as client:
         try:
-            # AND-filter: name must contain both "Alejandro" AND "Pending".
-            # This avoids matching real customer deals like
-            # "Magento Order XXXXX from Alejandro [LastName]" (no "Pending" token).
             resp = await client.post(
                 f"{BASE_URL}/crm/v3/objects/deals/search",
                 headers=_headers(),
                 json={
-                    "filterGroups": [{
-                        "filters": [
-                            {
-                                "propertyName": "dealname",
-                                "operator": "CONTAINS_TOKEN",
-                                "value": "Alejandro",
-                            },
-                            {
-                                "propertyName": "dealname",
-                                "operator": "CONTAINS_TOKEN",
-                                "value": "Pending",
-                            },
-                        ]
-                    }],
+                    "filterGroups": [{"filters": filters}],
                     "properties": ["dealname"],
                     "limit": 10,
                 },
@@ -348,15 +442,14 @@ async def complete_test_order() -> bool:
             logger.info("hubspot_deals_found", count=len(all_results),
                         names=[r["properties"].get("dealname", "") for r in all_results])
 
-            # Python-side: must contain the exact phrase "alejandro pending verification"
+            # Python-side: deal name must contain "pending"
             results = [
                 r for r in all_results
-                if "alejandro pending verification" in
-                r["properties"].get("dealname", "").lower()
+                if "pending" in r["properties"].get("dealname", "").lower()
             ]
 
             if not results:
-                logger.warning("test_order_not_found", name=TEST_ORDER_NAME,
+                logger.warning("test_order_not_found", hint=deal_name_hint,
                                all_names=[r["properties"].get("dealname", "") for r in all_results])
                 return False
 
@@ -364,13 +457,17 @@ async def complete_test_order() -> bool:
             deal_id = deal["id"]
             current_name = deal["properties"].get("dealname", "")
 
-            # Safety guard — never touch any deal that isn't the exact test order
-            if "alejandro pending verification" not in current_name.lower():
+            if "pending" not in current_name.lower():
                 logger.warning("test_order_safety_guard", deal_name=current_name)
                 return False
 
-            # Rename: "Pending Verification" → "Completed"
-            new_name = current_name.replace("Pending Verification", "Completed")
+            # Rename: replace "Pending Verification" or just "Pending" → "Completed"
+            if "Pending Verification" in current_name:
+                new_name = current_name.replace("Pending Verification", "Completed")
+            elif "Pending" in current_name:
+                new_name = current_name.replace("Pending", "Completed")
+            else:
+                new_name = current_name + " (Completed)"
 
             patch = await client.patch(
                 f"{BASE_URL}/crm/v3/objects/deals/{deal_id}",

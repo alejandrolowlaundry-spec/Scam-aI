@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     hubspot_api_key: str = ""
     hubspot_access_token: str = ""       # fallback alias
     hubspot_fraud_pending_stage: str = "Pending Verification for Fraud"
+    # Deal stage IDs to move to after verification (get from HubSpot pipeline settings)
+    hubspot_stage_safe_customer: str = ""   # e.g. "closedwon"
+    hubspot_stage_fraud: str = ""           # e.g. "closedlost"
+    hubspot_stage_review: str = ""          # e.g. "decisionmakerboughtin"
 
     # ElevenLabs
     elevenlabs_api_key: str = ""
