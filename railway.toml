@@ -1,7 +1,6 @@
 [build]
-builder = "NIXPACKS"
+builder = "DOCKERFILE"
+dockerfilePath = "frontend/Dockerfile"
 
 [deploy]
-
-healthcheckPath = "/health"
 healthcheckTimeout = 120
