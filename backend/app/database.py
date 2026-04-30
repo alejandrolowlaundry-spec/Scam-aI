@@ -3,7 +3,7 @@ from sqlalchemy.orm import DeclarativeBase
 from app.config import settings
 
 
-_db_url = settings.database_url
+_db_url = settings.database_url or "sqlite+aiosqlite:///./fraud_detection.db"
 if _db_url.startswith("postgres://"):
     _db_url = _db_url.replace("postgres://", "postgresql+asyncpg://", 1)
 elif _db_url.startswith("postgresql://"):
