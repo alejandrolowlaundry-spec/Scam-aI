@@ -39,7 +39,9 @@ export function TestingPage() {
       setForm({ phone: '', email: '', order_name: '', hubspot_deal_id: '' })
     },
     onError: (err: any) => {
-      alert(err?.response?.data?.detail || 'Failed to initiate test call')
+      console.error('Test call error:', err?.response?.status, err?.response?.data, err?.message)
+      const detail = err?.response?.data?.detail || err?.response?.data?.message || err?.message || 'Failed to initiate test call'
+      alert(`Error: ${detail}`)
     },
   })
 
